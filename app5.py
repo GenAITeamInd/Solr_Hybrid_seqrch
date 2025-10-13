@@ -10,7 +10,7 @@ import math
 import pandas as pd
 
 # ========== 1. Configure Gemini ========== #
-genai.configure(api_key="AIzaSyBBrBs7jyHoDDvE87MGzWg2i1pCGgcYV6w")  # 🔁 Replace with your Gemini API key
+genai.configure(api_key="")  # 🔁 Replace with your Gemini API key
 
 # ========== 2. Configure Solr ========== #
 solr = pysolr.Solr("http://localhost:8983/solr/core1", always_commit=True, timeout=10)
@@ -378,3 +378,4 @@ if st.button("Generate & Search") and user_query.strip():
 
         except Exception as e:
             st.error(f"❌ Error: {str(e)}")
+
