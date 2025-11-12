@@ -1,381 +1,252 @@
 import streamlit as st
-import google.generativeai as genai
+from openai import AzureOpenAI
 import pysolr
 from langchain.chains import LLMChain
 from langchain_core.output_parsers import StrOutputParser
 from prompt_template import get_few_shot_prompt
 from langchain.llms.base import LLM
-from typing import Optional, List, Dict, Tuple
-import math
-import pandas as pd
+from typing import Optional, List
+import json
+import os
 
-# ========== 1. Configure Gemini ========== #
-genai.configure(api_key="")  # 🔁 Replace with your Gemini API key
+# ================= Configuration =================
+AZURE_CHAT_MODEL = "dt_trial_gpt-4o"
+AZURE_EMBED_MODEL = "dt_trial_text-embedding-3-large"
+
+BASE_URL_embed = "https://azdtapimanager.azure-api.net/newllm/deployments/dt_trial_text-embedding-3-large/embeddings?api-version=2023-05-15"
+BASE_URL_chat= "https://azdtapimanager.azure-api.net/newllm/deployments/dt_trial_gpt-4o/chat/completions?api-version=2024-08-01-preview"
+AZURE_OPENAI_API_KEY = "280ea43fe4674b42adfaa2bddbe45d9f"
+
+chat_client = AzureOpenAI(
+    api_key=AZURE_OPENAI_API_KEY,                  
+    azure_endpoint=BASE_URL_chat,
+    api_version="2024-08-01-preview"
+)
+
+embed_client = AzureOpenAI(
+    api_key=AZURE_OPENAI_API_KEY,
+    azure_endpoint=BASE_URL_embed,
+    api_version="2023-05-15"
+)
 
 # ========== 2. Configure Solr ========== #
-solr = pysolr.Solr("http://localhost:8983/solr/core1", always_commit=True, timeout=10)
+solr = pysolr.Solr("http://localhost:8983/solr/core8", always_commit=True, timeout=10)
 
 # ========== 3. Solr Fields ========== #
-solr_fields = ["id", "title", "content_text", "author", "brand", "type", "date_of_publish"]
+solr_fields = ["id", "title", "content_text", "author", "brand", "type", "date_of_publish", "content_embedding"]
 
-# Sensible defaults for edismax hybrid fallback (tune for your schema)
-EDISMAX_QF = "title^5 content_text^2 author^0.5 brand^0.5 type^0.2"
-EDISMAX_PF = "title^8 content_text^3"
-# Removed recency boost due to multi-valued field issue
-ROWS = 25
-KNN_TOPK_PRIMARY = 5
-KNN_TOPK_FALLBACK = 75  # broaden on fallback
+# ========== 4. Synonym Expansion ========== #
+SYNONYM_MAP = {
+    "j&j": "johnson&johnson",
+    "sop": "procedural",
+}
 
-# ========== 4. Gemini LLM Wrapper, Answer Generation, and Scoring ========== #
-def score_with_gemini(query: str, document_text: str) -> float:
-    """Score the relevance of a document to the query using Gemini."""
-    model = genai.GenerativeModel("models/gemini-pro")
-    prompt = f"""
-Rate the relevance of this document to the query on a scale from 0 to 1.
-Query: {query}
-Document: {document_text[:1000]}  # Limit document length for token constraints
-Return only the number (e.g., 0.95), no other text.
-"""
-    try:
-        response = model.generate_content(prompt)
-        score = float(response.text.strip())
-        return max(0.0, min(1.0, score))  # Ensure score is between 0 and 1
-    except Exception:
-        return 0.0
-def generate_answer(query: str, docs: List[dict]) -> str:
-    """Generate an answer using the documents as context"""
-    model = genai.GenerativeModel("models/gemini-1.5-flash")
-    context = "\n\n".join([
-        f"Document {i+1}:\nTitle: {doc.get('title', '')}\nContent: {doc.get('content_text', '')[:1000]}"
-        for i, doc in enumerate(docs[:3])  # Use top 3 docs as context
-    ])
-    prompt = f"""
-Based on the following documents, answer the query: "{query}"
 
-Context documents:
-{context}
+def expand_synonyms(query: str) -> str:
+    words = query.lower().split()
+    for i, word in enumerate(words):
+        if word in SYNONYM_MAP:
+            words[i] = SYNONYM_MAP[word]
+    return " ".join(words)
 
-Provide a clear, accurate answer based on the information in these documents.
-If you cannot find relevant information in the documents, say so.
-Include inline citations like [Doc 1], [Doc 2] etc. when referencing specific documents.
+# ========== Utility: normalize text fields (handle list vs str) ========== #
 
-Answer:"""
-    response = model.generate_content(prompt)
-    return response.text.strip()
+def normalize_text(value):
+    """Convert possibly-list values from Solr into a single string."""
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        # join list elements into a single string
+        return " ".join([str(v) for v in value])
+    return str(value)
 
-class GeminiLLM(LLM):
-    model: str = "models/gemini-1.5-flash"
+# ========== 5. Azure OpenAI LLM Wrapper ========== #
+class AzureOpenAILLM(LLM):
+    model: str = AZURE_CHAT_MODEL
     temperature: float = 0.1
     top_p: float = 0.95
     max_tokens: int = 512
 
     def _call(self, prompt: str, stop: Optional[List[str]] = None) -> str:
-        model = genai.GenerativeModel(self.model)
-        response = model.generate_content(prompt)
-        return (response.text or "").strip()
+        # IMPORTANT: use the chat_client (not embed_client)
+        response = chat_client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+            top_p=self.top_p
+        )
+        # support both message.content or text depending on SDK
+        try:
+            return response.choices[0].message.content.strip()
+        except Exception:
+            # fallback if response shape differs
+            return str(response).strip()
 
     @property
     def _llm_type(self) -> str:
-        return "google-gemini"
+        return "azure-openai"
 
-# ========== 5. Embedding Helper ========== #
-def get_gemini_embedding(text: str) -> List[float]:
-    """Returns a list[float] embedding compatible with Solr's dense vector field."""
-    # Gemini embeddings API
-    emb = genai.embed_content(model="models/embedding-001", content=text, task_type="retrieval_query")
-    return emb["embedding"]
-
-def average_vectors(vectors: List[List[float]]) -> List[float]:
-    if not vectors:
+# ========== 6. Embedding Helper ========== #
+def get_azure_embedding(text: str) -> list:
+    """Return Azure embedding vector as list of floats."""
+    if not text:
         return []
-    length = len(vectors[0])
-    sums = [0.0] * length
-    for v in vectors:
-        if len(v) != length:
-            continue  # skip mis-sized vectors defensively
-        for i, x in enumerate(v):
-            sums[i] += float(x)
-    n = max(1, len(vectors))
-    return [s / n for s in sums]
+    response = embed_client.embeddings.create(
+        model=AZURE_EMBED_MODEL,
+        input=text
+    )
+    return response.data[0].embedding
 
-# ========== 6. Gemini-based Intent Classification ========== #
+# ========== 7. Query Classification ========== #
 def classify_query_type(query: str) -> str:
-    model = genai.GenerativeModel("models/gemini-1.5-flash")
     prompt = f"""
 You are a classifier that labels user queries as either 'keyword' or 'semantic'.
 
 Label as 'keyword' if the query:
 - Refers to specific fields (like title, author, brand, type, date_of_publish)
-- Uses terms like “created by”, “greater than”, “before”, “between”, etc.
+- Uses terms like "created by", "greater than", "before", "between", etc.
 - Involves filtering based on fields or values
 
 Label as 'semantic' if the query:
-- Asks conceptual or natural questions (like “symptoms of depression”, “how to treat infection”)
+- Asks conceptual or natural questions (like "percentage of alcohol in sanitizers", "how to treat infections", "work ID for task A")
 - Has no obvious fields or structure
 - Is vague or short with a broad intent
 
-Examples:
-
-Query: documents created by user1 in the last 30 days  
-Label: keyword
-
-Query: show documents of type procedures authored by author1  
-Label: keyword
-
-Query: symptoms of depression  
-Label: semantic
-
-Query: how to cure flu  
-Label: semantic
-
 Now classify this query:
-
 Query: {query}
 Label:
 """.strip()
-    response = model.generate_content(prompt)
-    label = (response.text or "").strip().lower()
+
+    response = chat_client.chat.completions.create(
+        model=AZURE_CHAT_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0
+    )
+    label = response.choices[0].message.content.strip().lower()
     return "semantic" if "semantic" in label else "keyword"
 
-# ========== 7. LangChain Setup (for keyword query authoring) ========== #
-llm = GeminiLLM()
+# ========== 8. Relevance Scoring ========== #
+def score_with_azure(query: str, document_text: str) -> float:
+    prompt = f"""
+Score the relevance of the following document to the query on a scale from 0 to 1.
+Query: {query}
+Document: {document_text}
+Score only the number, no explanation.
+""".strip()
+
+    response = chat_client.chat.completions.create(
+        model=AZURE_CHAT_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0
+    )
+    try:
+        score = float(response.choices[0].message.content.strip())
+        return max(0.0, min(1.0, score))
+    except ValueError:
+        return 0.0
+
+# ========== 9. LangChain Setup ========== #
+llm = AzureOpenAILLM()
 prompt = get_few_shot_prompt()
 chain = LLMChain(llm=llm, prompt=prompt, output_parser=StrOutputParser())
 
-# ========== 8. Hybrid Fallback Helpers ========== #
-def expand_query_with_gemini(query: str) -> Dict[str, List[str]]:
-    """
-    Ask Gemini for expansions we can OR into an edismax query and also
-    leverage for vector search. Keep output simple and parseable.
-    """
-    model = genai.GenerativeModel("models/gemini-1.5-flash")
-    p = f"""
-Given the user query:
-"{query}"
+# ========== 10. Streamlit UI ========== #
+st.set_page_config(page_title="Solr + Azure OpenAI Semantic Search", layout="centered")
+st.title("🔍 Solr + Azure OpenAI: Smart Search Assistant")
 
-1) Provide up to 5 short keyphrases (≤3 words) capturing the intent.
-2) Provide up to 3 paraphrases (concise).
-3) Provide up to 6 domain-related synonyms/aliases.
-
-Return as JSON with keys: keyphrases, paraphrases, synonyms. No extra text.
-"""
-    resp = model.generate_content(p)
-    import json
-    try:
-        data = json.loads((resp.text or "").strip())
-        return {
-            "keyphrases": [s.strip() for s in data.get("keyphrases", []) if s.strip()],
-            "paraphrases": [s.strip() for s in data.get("paraphrases", []) if s.strip()],
-            "synonyms": [s.strip() for s in data.get("synonyms", []) if s.strip()],
-        }
-    except Exception:
-        # very defensive fallback
-        return {"keyphrases": [query], "paraphrases": [], "synonyms": []}
-
-def build_edismax_query(user_query: str, exp: Dict[str, List[str]]) -> Tuple[str, Dict[str, str]]:
-    """
-    Build a broad, recall-friendly edismax query for fallback.
-    - OR together: original, paraphrases, keyphrases, synonyms
-    - Keep phrases quoted to benefit 'pf' boosting
-    """
-    terms = [user_query] + exp.get("paraphrases", []) + exp.get("keyphrases", []) + exp.get("synonyms", [])
-    # Quote multi-word terms to help phrase matching; single tokens can be bare
-    def fmt(t: str) -> str:
-        t = t.strip()
-        return f'"{t}"' if " " in t else t
-    or_query = " OR ".join(fmt(t) for t in dict.fromkeys(terms))  # de-duplicate in order
-    params = {
-        "defType": "edismax",
-        "qf": EDISMAX_QF,
-        "pf": EDISMAX_PF,
-        "ps": "2",
-        "qs": "1",
-        "q.op": "OR",
-        "mm": "1",  # allow very permissive matching for recall
-        "tie": "0.1",
-        "rows": str(ROWS * 3)  # broaden candidate pool for fusion
-    }
-    return or_query, params
-
-def run_keyword(solr_q: str, params: Dict[str, str]):
-    return solr.search(solr_q, **params)
-
-def run_knn(vector: List[float], topk: int):
-    vec = "[" + ",".join(map(str, vector)) + "]"
-    knn_q = f"{{!knn f=content_embedding topK={topk}}}{vec}"
-    return solr.search(knn_q, rows=str(min(topk, ROWS * 3)))
-
-def rrf_fuse(bm25_docs: List[dict], knn_docs: List[dict], k: int = 60, max_out: int = ROWS) -> List[dict]:
-    """
-    Reciprocal Rank Fusion: score(d) = sum(1 / (k + rank_d_list))
-    """
-    id_to_doc: Dict[str, dict] = {}
-    ranks: Dict[str, float] = {}
-
-    def add_list(docs: List[dict], weight: float = 1.0):
-        for idx, d in enumerate(docs):
-            doc_id = d.get("id")
-            if not doc_id:
-                continue
-            id_to_doc.setdefault(doc_id, d)
-            score = 1.0 / (k + (idx + 1))
-            ranks[doc_id] = ranks.get(doc_id, 0.0) + weight * score
-
-    add_list(bm25_docs, weight=1.0)
-    add_list(knn_docs, weight=1.0)
-
-    sorted_ids = sorted(ranks.items(), key=lambda x: x[1], reverse=True)
-    fused = [id_to_doc[_id] for _id, _ in sorted_ids[:max_out]]
-    return fused
-
-def safe_table_rows(docs: List[dict]) -> List[dict]:
-    return [{field: doc.get(field, "") for field in solr_fields} for doc in docs]
-
-# ========== 9. Streamlit UI ========== #
-st.set_page_config(page_title="Solr + Gemini Semantic Search", layout="centered")
-st.title("🔍 Solr + Gemini: Smart Search Assistant")
-
-st.markdown("Enter a natural language query. The app auto-detects keyword vs semantic; if both fail, it uses a hybrid fallback (query expansion + RRF fusion).")
+st.markdown("Enter a natural language query. The app will auto-detect if it should use keyword or semantic search.")
 
 with st.expander("🧾 View Solr Fields"):
     st.code(", ".join(solr_fields))
 
-user_query = st.text_input("💬 Your Query:", placeholder="e.g. Show documents of type procedures OR Symptoms of depression")
+raw_query = st.text_input("💬 Your Query:", placeholder="e.g. Show documents of type procedures OR Symptoms of depression")
+user_query = expand_synonyms(raw_query)
 
 if st.button("Generate & Search") and user_query.strip():
-    with st.spinner("Detecting intent with Gemini and querying Solr..."):
+    with st.spinner("Detecting intent with Azure OpenAI and querying Solr..."):
         try:
-            # ---------- Step 1: Detect Query Type ----------
             query_type = classify_query_type(user_query).capitalize()
-            st.info(f"🔍 Detected Query Type (via Gemini): **{query_type} Search**")
+            st.info(f"🔍 Detected Query Type (via Azure OpenAI): **{query_type} Search**")
 
-            # ---------- Step 2: Execute Identified Search Type ----------
             results = []
 
             if query_type == "Keyword":
+                # --- Generate and run Solr keyword query --- #
                 solr_query = chain.run({
                     "user_query": user_query,
                     "fields": ", ".join(solr_fields)
                 }).strip()
-                st.success("✅ Generated Solr (Keyword) Query:")
-                st.code(solr_query)
-                results = list(solr.search(solr_query, rows=str(ROWS)))
-            else:
-                embedding = get_gemini_embedding(user_query)
-                vector_str = "[" + ",".join(map(str, embedding)) + "]"
-                solr_query = f"{{!knn f=content_embedding topK={KNN_TOPK_PRIMARY}}}{vector_str}"
-                st.success("✅ Semantic Vector Query:")
-                st.code(solr_query)
-                results = list(solr.search(solr_query, rows=str(ROWS)))
+                if solr_query.lower().startswith("solr query:"):
+                    solr_query = solr_query.split(":", 1)[1].strip()
 
-            # ---------- Step 3: Show Results or Try Hybrid ----------
-            if results:
-                if query_type == "Semantic":
-                    # Filter results with score > 0.8 for semantic search
+                st.success("✅ Generated Solr Query:")
+                st.code(solr_query)
+                results = solr.search(q=solr_query)
+
+            elif query_type == "Semantic":
+                # --- Generate embedding and query Solr using KNN --- #
+                embedding = get_azure_embedding(user_query)
+                st.write("📏 Embedding length:", len(embedding))
+
+                if not embedding:
+                    st.warning("Failed to create embedding for query.")
+                    results = []
+                else:
+                    # Convert embedding list to JSON array for Solr (as text)
+                    vector_json = json.dumps(embedding)
+                    solr_query = f"{{!knn f=content_embedding topK=5}}{vector_json}"
+
+                    raw_results = solr.search(solr_query, **{
+                        "fl": ",".join(solr_fields),
+                        "rows": 5
+                    })
+
+                    # Normalize and re-score results
                     scored_docs = []
-                    for doc in results:
-                        doc_text = f"{doc.get('title', '')} {doc.get('content_text', '')}"
-                        score = score_with_gemini(user_query, doc_text)
-                        if score > 0.8:  # Only keep highly relevant documents
-                            filtered_doc = {field: doc.get(field, "") for field in solr_fields}
+                    for doc in raw_results:
+                        title_text = normalize_text(doc.get('title', ''))
+                        content_text = normalize_text(doc.get('content_text', ''))
+                        doc_text = f"{title_text} {content_text}".strip()
+
+                        score = score_with_azure(user_query, doc_text)
+                        if score > 0.7:
+                            filtered_doc = {field: normalize_text(doc.get(field, "")) for field in solr_fields}
                             filtered_doc["score"] = score
                             scored_docs.append(filtered_doc)
-                    
-                    if scored_docs:
-                        # For semantic search, generate an answer and show supporting documents
-                        st.markdown("### 🤖 Generated Answer:")
-                        with st.spinner("Generating answer from documents..."):
-                            answer = generate_answer(user_query, scored_docs[:3])
-                            st.markdown(answer)
-                        
-                        st.markdown("### 📚 Supporting Documents (Relevance Score > 0.8):")
-                        st.dataframe(pd.DataFrame(scored_docs), use_container_width=True)
-                    else:
-                        st.warning("No documents found with relevance score > 0.8")
-                else:
-                    # For keyword search, just show the matching documents
-                    st.markdown(f"### 📄 Found {len(results)} result(s) with {query_type} Search:")
-                    st.dataframe(safe_table_rows(results[:ROWS]), use_container_width=True)
-                
-                if query_type == "Semantic" and not scored_docs:
-                    # If no high-scoring results, continue to hybrid search
-                    st.info("Trying hybrid search for better results...")
-                else:
-                    st.stop()
 
-            # ---------- Hybrid Fallback: Expansion + Broad EDisMax + Larger kNN + RRF ----------
-            st.warning(f"No results from {query_type} search. Running hybrid fallback (expansion + fusion).")
+                    scored_docs.sort(key=lambda x: x["score"], reverse=True)
+                    results = scored_docs
 
-            expansions = expand_query_with_gemini(user_query)
-            st.write("**🔧 Expansions used**")
-            st.json(expansions)
+                    # --- Generate final LLM answer using RAG --- #
+                    if results:
+                        context = "\n\n".join([normalize_text(doc.get("content_text")) for doc in results[:3]])
+                        rag_prompt = f"""
+You are an assistant. Answer the following question using only the provided documents.
 
-            # Build generous edismax query
-            edismax_q, edismax_params = build_edismax_query(user_query, expansions)
-            st.info("🧪 Fallback EDisMax Query:")
-            st.code(f"q={edismax_q}\nparams={edismax_params}")
+Question: {user_query}
 
-            # Run broad keyword search
-            bm25_docs = list(run_keyword(edismax_q, edismax_params))
+Documents:
+{context}
 
-            # Compute an averaged embedding from original + paraphrases/keyphrases
-            texts_for_vec = [user_query] + expansions.get("paraphrases", []) + expansions.get("keyphrases", [])
-            vecs = []
-            for t in texts_for_vec[:8]:  # cap calls
-                try:
-                    vecs.append(get_gemini_embedding(t))
-                except Exception:
-                    pass
-            hybrid_vec = average_vectors(vecs) if vecs else get_gemini_embedding(user_query)
+Answer:
+""".strip()
 
-            # Run larger kNN
-            knn_docs = list(run_knn(hybrid_vec, topk=KNN_TOPK_FALLBACK))
+                        response = chat_client.chat.completions.create(
+                            model=AZURE_CHAT_MODEL,
+                            messages=[{"role": "user", "content": rag_prompt}],
+                            temperature=0.3
+                        )
+                        rag_answer = response.choices[0].message.content.strip()
+                        st.markdown("### 🤖 LLM Answer:")
+                        st.write(rag_answer)
 
-            # Fuse with RRF
-            fused = rrf_fuse(bm25_docs, knn_docs, k=60, max_out=ROWS)
-
-            st.markdown(f"### 📄 Hybrid Search Results")
-            if fused:
-                # Score and filter hybrid results
-                scored_docs = []
-                for doc in fused:
-                    doc_text = f"{doc.get('title', '')} {doc.get('content_text', '')}"
-                    score = score_with_gemini(user_query, doc_text)
-                    if score > 0.5:  # Lower threshold for hybrid search
-                        filtered_doc = {field: doc.get(field, "") for field in solr_fields}
-                        filtered_doc["score"] = score
-                        scored_docs.append(filtered_doc)
-                
-                if scored_docs:
-                    # Generate an answer using the filtered results
-                    st.markdown("### 🤖 Generated Answer:")
-                    with st.spinner("Generating answer from hybrid search results..."):
-                        answer = generate_answer(user_query, scored_docs[:3])
-                        st.markdown(answer)
-                    
-                    st.markdown("### 📚 Supporting Documents (Relevance Score > 0.5):")
-                    st.dataframe(pd.DataFrame(scored_docs), use_container_width=True)
-                else:
-                    st.warning("No documents found with relevance score > 0.5 in hybrid search")
+            # --- Display Results --- #
+            st.markdown(f"### 📄 Found {len(results)} result(s):")
+            if results:
+                st.dataframe(results, use_container_width=True)
             else:
-                # Last-resort ultra-broad fuzzy query (kept lightweight)
-                fuzzy_q = f'"{user_query}"~3 {user_query}~2'
-                st.info("🔎 Last-resort fuzzy EDisMax query (very broad):")
-                st.code(fuzzy_q)
-                fuzzy_docs = list(solr.search(
-                    fuzzy_q,
-                    defType="edismax",
-                    qf=EDISMAX_QF,
-                    pf=EDISMAX_PF,
-                    mm="1",
-                    q__op="OR",
-                    rows=str(ROWS)
-                ))
-                if fuzzy_docs:
-                    st.dataframe(safe_table_rows(fuzzy_docs), use_container_width=True)
-                else:
-                    st.warning("No results found, even after hybrid fallback.")
+                st.warning("No results found.")
 
         except Exception as e:
             st.error(f"❌ Error: {str(e)}")
-
