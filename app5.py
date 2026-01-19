@@ -1,36 +1,84 @@
+#---chat------------------------------
+import os
+from urllib import response
+from urllib import response
+from langchain_ollama import ChatOllama
+
+
+
+
+ollama_base_url= "http://azdtapimanager.azure-api.net/ollama"
+ollama_api_key= ""
+
+print(ollama_api_key[:4] + "*"*8 + ollama_api_key[-4:])
+print(ollama_base_url[:4] + "*"*20 + ollama_base_url[-4:])
+
+
+# messages = [
+#     ("system", "You are a helpful assistant that translates English to French."),
+#     ("human", "I love programming.")
+# ]
+
+# response = chat_model.invoke(messages)
+# print(response.content)
+
+
+#------------------embeddings------------------------
+# from langchain_ollama import OllamaEmbeddings
+# embeddings_model = OllamaEmbeddings(
+#     model="nomic-embed-text",
+#     base_url=ollama_base_url,
+#     client_kwargs={
+#         "headers": {
+#             "api-key": ollama_api_key,
+#             "Content-Type": "application/json",
+#         }
+#     },
+#     validate_model_on_init=False
+# )
+# embeddings= embeddings_model.embed_query("Explain data migration")
+# print(embeddings)
+
+
+#------------------------------------------------------------------------------------
+
 import streamlit as st
-from openai import AzureOpenAI
+
 import pysolr
-from langchain.chains import LLMChain
+from langchain_classic.chains import LLMChain
 from langchain_core.output_parsers import StrOutputParser
 from prompt_template import get_few_shot_prompt
-from langchain.llms.base import LLM
+
+ 
 from typing import Optional, List
 import json
 import os
 
 # ================= Configuration =================
-AZURE_CHAT_MODEL = "dt_trial_gpt-4o"
-AZURE_EMBED_MODEL = "dt_trial_text-embedding-3-large"
+# AZURE_CHAT_MODEL = "dt_trial_gpt-4o"
+# AZURE_EMBED_MODEL = "dt_trial_text-embedding-3-large"
 
-BASE_URL_embed = "https://azdtapimanager.azure-api.net/newllm/deployments/dt_trial_text-embedding-3-large/embeddings?api-version=2023-05-15"
-BASE_URL_chat= "https://azdtapimanager.azure-api.net/newllm/deployments/dt_trial_gpt-4o/chat/completions?api-version=2024-08-01-preview"
-AZURE_OPENAI_API_KEY = "280ea43fe4674b42adfaa2bddbe45d9f"
+# BASE_URL_embed = "https://azdtapimanager.azure-api.net/newllm/deployments/dt_trial_text-embedding-3-large/embeddings?api-version=2023-05-15"
+# BASE_URL_chat= "https://azdtapimanager.azure-api.net/newllm/deployments/dt_trial_gpt-4o/chat/completions?api-version=2024-08-01-preview"
+# AZURE_OPENAI_API_KEY = "280ea43fe4674b42adfaa2bddbe45d9f"
 
-chat_client = AzureOpenAI(
-    api_key=AZURE_OPENAI_API_KEY,                  
-    azure_endpoint=BASE_URL_chat,
-    api_version="2024-08-01-preview"
+chat_client = ChatOllama(
+    model="llama3",
+    base_url=ollama_base_url,
+    client_kwargs={
+        "headers": {
+            "api-key": ollama_api_key,
+            "Content-Type": "application/json",
+        }
+    },
+    validate_model_on_init=False
 )
 
-embed_client = AzureOpenAI(
-    api_key=AZURE_OPENAI_API_KEY,
-    azure_endpoint=BASE_URL_embed,
-    api_version="2023-05-15"
-)
+from langchain_ollama import OllamaEmbeddings
+
 
 # ========== 2. Configure Solr ========== #
-solr = pysolr.Solr("http://localhost:8983/solr/core8", always_commit=True, timeout=10)
+solr = pysolr.Solr("http://localhost:8983/solr/core5", always_commit=True, timeout=10)
 
 # ========== 3. Solr Fields ========== #
 solr_fields = ["id", "title", "content_text", "author", "brand", "type", "date_of_publish", "content_embedding"]
@@ -61,42 +109,49 @@ def normalize_text(value):
     return str(value)
 
 # ========== 5. Azure OpenAI LLM Wrapper ========== #
-class AzureOpenAILLM(LLM):
-    model: str = AZURE_CHAT_MODEL
-    temperature: float = 0.1
-    top_p: float = 0.95
-    max_tokens: int = 512
+# class AzureOpenAILLM(LLM):
+#     model: str = AZURE_CHAT_MODEL
+#     temperature: float = 0.1
+#     top_p: float = 0.95
+#     max_tokens: int = 512
 
-    def _call(self, prompt: str, stop: Optional[List[str]] = None) -> str:
-        # IMPORTANT: use the chat_client (not embed_client)
-        response = chat_client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
-            top_p=self.top_p
-        )
-        # support both message.content or text depending on SDK
-        try:
-            return response.choices[0].message.content.strip()
-        except Exception:
-            # fallback if response shape differs
-            return str(response).strip()
+#     def _call(self, prompt: str, stop: Optional[List[str]] = None) -> str:
+#         # IMPORTANT: use the chat_client (not embed_client)
+#         response = chat_client.chat.completions.create(
+#             model=self.model,
+#             messages=[{"role": "user", "content": prompt}],
+#             temperature=self.temperature,
+#             max_tokens=self.max_tokens,
+#             top_p=self.top_p
+#         )
+#         # support both message.content or text depending on SDK
+#         try:
+#             return response.choices[0].message.content.strip()
+#         except Exception:
+#             # fallback if response shape differs
+#             return str(response).strip()
 
-    @property
-    def _llm_type(self) -> str:
-        return "azure-openai"
+#     @property
+#     def _llm_type(self) -> str:
+#         return "azure-openai"
 
 # ========== 6. Embedding Helper ========== #
 def get_azure_embedding(text: str) -> list:
     """Return Azure embedding vector as list of floats."""
-    if not text:
-        return []
-    response = embed_client.embeddings.create(
-        model=AZURE_EMBED_MODEL,
-        input=text
-    )
-    return response.data[0].embedding
+    embed_client = OllamaEmbeddings(
+    model="nomic-embed-text",
+    base_url=ollama_base_url,
+    client_kwargs={
+        "headers": {
+            "api-key": ollama_api_key,
+            "Content-Type": "application/json",
+        }
+    },
+    validate_model_on_init=False
+)
+    embeddings= embed_client.embed_query(text)
+    print(embeddings)
+    return embeddings
 
 # ========== 7. Query Classification ========== #
 def classify_query_type(query: str) -> str:
@@ -118,12 +173,12 @@ Query: {query}
 Label:
 """.strip()
 
-    response = chat_client.chat.completions.create(
-        model=AZURE_CHAT_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0
-    )
-    label = response.choices[0].message.content.strip().lower()
+   
+    messages=[("human",prompt)]
+        
+    response = chat_client.invoke(messages)
+    print(response.content)
+    label = response.content
     return "semantic" if "semantic" in label else "keyword"
 
 # ========== 8. Relevance Scoring ========== #
@@ -135,19 +190,20 @@ Document: {document_text}
 Score only the number, no explanation.
 """.strip()
 
-    response = chat_client.chat.completions.create(
-        model=AZURE_CHAT_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0
-    )
+    
+    messages=[('human', prompt)]
+       
+    response = chat_client.invoke(messages)
+    print()
+    print(response.content)
     try:
-        score = float(response.choices[0].message.content.strip())
+        score = float(response.content)
         return max(0.0, min(1.0, score))
     except ValueError:
         return 0.0
 
 # ========== 9. LangChain Setup ========== #
-llm = AzureOpenAILLM()
+llm = chat_client
 prompt = get_few_shot_prompt()
 chain = LLMChain(llm=llm, prompt=prompt, output_parser=StrOutputParser())
 
@@ -174,8 +230,7 @@ if st.button("Generate & Search") and user_query.strip():
             if query_type == "Keyword":
                 # --- Generate and run Solr keyword query --- #
                 solr_query = chain.run({
-                    "user_query": user_query,
-                    "fields": ", ".join(solr_fields)
+                    "user_query": user_query
                 }).strip()
                 if solr_query.lower().startswith("solr query:"):
                     solr_query = solr_query.split(":", 1)[1].strip()
@@ -221,9 +276,10 @@ if st.button("Generate & Search") and user_query.strip():
                     # --- Generate final LLM answer using RAG --- #
                     if results:
                         context = "\n\n".join([normalize_text(doc.get("content_text")) for doc in results[:3]])
+                        print("line ---------- 279---------------")
                         rag_prompt = f"""
-You are an assistant. Answer the following question using only the provided documents.
 
+You are an assistant. Answer the following question using only the provided documents.
 Question: {user_query}
 
 Documents:
@@ -232,21 +288,21 @@ Documents:
 Answer:
 """.strip()
 
-                        response = chat_client.chat.completions.create(
-                            model=AZURE_CHAT_MODEL,
-                            messages=[{"role": "user", "content": rag_prompt}],
-                            temperature=0.3
-                        )
-                        rag_answer = response.choices[0].message.content.strip()
+                        
+                        messages=[('human', rag_prompt)]
+                            
+                        response = chat_client.invoke(messages)
+                        rag_answer = response.content
                         st.markdown("### 🤖 LLM Answer:")
                         st.write(rag_answer)
 
             # --- Display Results --- #
             st.markdown(f"### 📄 Found {len(results)} result(s):")
             if results:
-                st.dataframe(results, use_container_width=True)
+                st.dataframe(results, width= 'stretch')
             else:
                 st.warning("No results found.")
 
         except Exception as e:
             st.error(f"❌ Error: {str(e)}")
+
